@@ -96,7 +96,10 @@ def probe_media(path: Path) -> MediaInfo:
 
 
 def detect_silence(
-    path: Path, threshold_db: float = -35.0, minimum_seconds: float = 0.45
+    path: Path,
+    threshold_db: float = -35.0,
+    minimum_seconds: float = 0.45,
+    mode: ResourceMode = ResourceMode.BALANCED,
 ) -> list[tuple[float, float]]:
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
@@ -116,8 +119,10 @@ def detect_silence(
             f"silencedetect=noise={threshold_db}dB:d={minimum_seconds}",
             "-f",
             "null",
-            "NUL",
-        ]
+            os.devnull,
+        ],
+        timeout=3600,
+        mode=mode,
     )
     if result.returncode:
         raise MediaToolError("silence analysis failed")

@@ -19,6 +19,8 @@ def run() -> int:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     database = Database(paths.database)
     seed_defaults(database)
     application = QApplication(sys.argv)

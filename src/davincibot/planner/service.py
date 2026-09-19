@@ -93,12 +93,39 @@ def offline_plan(
     if not videos:
         raise PlanningError("no probed A-roll, camera, or B-roll video is available")
     segments, graphics, rule_warnings = build_rule_segments(
-        workflow, profile.mode, spec.assets, spec.captions, template
+        workflow, profile.mode, spec.assets, spec.captions, template, spec.analysis
     )
     if not segments:
         raise PlanningError("the selected video files have no usable duration")
-    dialogue = [a.id for a in spec.assets if a.role in {AssetRole.A_ROLL, AssetRole.VOICE}]
+    dialogue = [
+        a.id for a in spec.assets if a.role in {AssetRole.A_ROLL, AssetRole.VOICE, AssetRole.CAMERA}
+    ]
     music = [a.id for a in spec.assets if a.role is AssetRole.MUSIC]
+    captions = retime_captions(spec.captions, segments, spec.assets)
+    if workflow is WorkflowKind.NARRATED_YOUTUBE:
+        captions = spec.captions
+    elif workflow is WorkflowKind.PODCAST_INTERVIEW:
+        captions = []
+        for segment in segments:
+            offset = spec.analysis.get("offsets", {}).get(segment.asset_id, 0)
+            for cue in spec.captions:
+                begin, end = (
+                    max(cue.start_seconds, segment.source_in - offset),
+                    min(cue.end_seconds, segment.source_out - offset),
+                )
+                if end > begin:
+                    captions.append(
+                        cue.model_copy(
+                            update={
+                                "start_seconds": segment.timeline_start
+                                + begin
+                                - (segment.source_in - offset),
+                                "end_seconds": segment.timeline_start
+                                + end
+                                - (segment.source_in - offset),
+                            }
+                        )
+                    )
     return EditPlan(
         job_id=spec.id,
         template_id=template.id,
@@ -107,9 +134,7 @@ def offline_plan(
         timeline_name=spec.target_project,
         segments=segments,
         graphics=graphics,
-        captions=retime_captions(spec.captions, segments, spec.assets)
-        if profile.captions.enabled
-        else [],
+        captions=captions if profile.captions.enabled else [],
         audio=AudioInstruction(
             dialogue_asset_ids=dialogue,
             music_asset_ids=music[:1],
@@ -118,7 +143,11 @@ def offline_plan(
             duck_db=profile.audio.music_duck_db,
         ),
         confidence=0.75,
-        warnings=["Offline planner used; review template and segment choices.", *rule_warnings],
+        warnings=[
+            "Offline planner used; review template and segment choices.",
+            *rule_warnings,
+            *spec.analysis.get("warnings", []),
+        ],
         planner_notes="Deterministic local fallback plan",
     )
 
@@ -134,6 +163,9 @@ class PlanningService:
         templates: list[TemplateManifest],
         provider_factory: Callable[[ProviderKind, str, str, str | None], PlannerProvider],
     ) -> EditPlan:
+        from davincibot.editing.analysis import analyze_job
+
+        spec.analysis = analyze_job(spec, profile)
         if spec.provider is ProviderKind.OFFLINE:
             return offline_plan(spec, profile, templates)
         key = self.secret_lookup(spec.provider)
@@ -206,6 +238,7 @@ class PlanningService:
                 "transcript": transcript,
                 "templates": template_data,
                 "overrides": spec.overrides,
+                "local_analysis": spec.analysis,
             },
             ensure_ascii=False,
         )
@@ -250,6 +283,10 @@ class PlanningService:
                 raise PlanningError(f"template does not support {segment.transition}")
             if segment.layout not in {"full", "punch_in"}:
                 raise PlanningError("only full and punch_in layouts are supported")
+            if segment.speed != 1:
+                raise PlanningError("speed changes require a retiming backend; use normal speed")
+            if not asset.media or asset.media.duration_seconds <= 0:
+                raise PlanningError("segment requires successfully probed media")
             allowed_tracks = {"DBOT_A_ROLL", "DBOT_B_ROLL"} | {s.track for s in selected.slots}
             if segment.track not in allowed_tracks:
                 raise PlanningError("plan uses a track outside the template contract")

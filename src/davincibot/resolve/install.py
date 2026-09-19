@@ -40,5 +40,8 @@ def install_launcher(destination: Path | None = None) -> Path:
     target.parent.mkdir(parents=True, exist_ok=True)
     source = Path(runtime.__file__).with_name("runtime.py")
     shutil.copyfile(source, target.with_name("davincibot_runtime.py"))
+    shutil.copyfile(
+        source.with_name("interchange.py"), target.with_name("davincibot_interchange.py")
+    )
     target.write_text(LAUNCHER, encoding="utf-8")
     return target

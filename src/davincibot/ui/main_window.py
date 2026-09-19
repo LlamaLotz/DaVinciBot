@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
 )
 
 from davincibot.assets import AssetScanner, ScanResult, partition_batches
+from davincibot.cache import ManagedCache
 from davincibot.database import Database
 from davincibot.jobs import JobService
 from davincibot.models import (
@@ -106,6 +107,10 @@ class MainWindow(QMainWindow):
         settings.clicked.connect(self.edit_settings)
         header.addWidget(settings)
         self.header_controls.append(settings)
+        cache = QPushButton("Cache usage / cleanup")
+        cache.clicked.connect(self.manage_cache)
+        header.addWidget(cache)
+        self.header_controls.append(cache)
         layout.addLayout(header)
 
         form = QFormLayout()
@@ -397,11 +402,13 @@ class MainWindow(QMainWindow):
         primary_groups = {
             asset.group_key
             for asset in base.assets
-            if asset.role in {AssetRole.A_ROLL, AssetRole.CAMERA}
+            if asset.role in {AssetRole.A_ROLL, AssetRole.CAMERA, AssetRole.VOICE}
         }
+        if not primary_groups:
+            primary_groups = {a.group_key for a in base.assets if a.role is AssetRole.B_ROLL}
         shared_roles = {AssetRole.MUSIC, AssetRole.GRAPHIC, AssetRole.TEMPLATE}
         specs: list[JobSpec] = []
-        for key in sorted(primary_groups or groups):
+        for key in sorted(primary_groups):
             selected = [
                 asset
                 for asset in base.assets
@@ -431,6 +438,9 @@ class MainWindow(QMainWindow):
             self.jobs.create(spec)
             try:
                 plan = self.planner.plan(spec, profile, templates, make_provider)
+                record = self.database.get_job(spec.id)
+                record.spec = spec
+                self.database.save_job(record)
                 self.jobs.attach_plan(spec.id, plan)
                 results.append((spec, plan))
             except Exception as error:
@@ -474,6 +484,14 @@ class MainWindow(QMainWindow):
     def _plan_complete(self, plan) -> None:
         if not self.current_job:
             return
+        if self.current_job.id != plan.job_id:
+            self._error("Received a plan for a different job; no job was modified.")
+            return
+        latest = self.database.get_job(plan.job_id)
+        if latest.state is JobState.CANCELLED:
+            return
+        latest.spec = self.current_job.spec
+        self.database.save_job(latest)
         self.current_job = self.jobs.attach_plan(self.current_job.id, plan)
         profile = self.current_job.spec.profile_snapshot or self._profile()
         template = self.database.get_template(plan.template_id, plan.template_version)
@@ -589,6 +607,9 @@ class MainWindow(QMainWindow):
                     raise ValueError(
                         "Choose an exported .drt file, or open Resolve Studio for registration."
                     )
+                import hashlib
+                with snapshot.open("rb") as handle:
+                    template.snapshot_sha256 = hashlib.file_digest(handle, "sha256").hexdigest()
                 self.database.save_template(template)
                 profile = self._profile()
                 if template.id not in profile.template_ids:
@@ -677,7 +698,15 @@ class MainWindow(QMainWindow):
         self.register_template(previous=previous)
 
     def edit_plan(self):
-        if not self.current_job or not self.current_job.plan:
+        if not self.current_job:
+            return
+        if not self.current_job.plan:
+            dialog = JsonDialog("Edit preserved job inputs", self.current_job.spec.model_dump(mode="json"),
+                                JobSpec.model_validate, self)
+            if dialog.exec():
+                spec = dialog.value.model_copy(update={"id": str(uuid4())})
+                self.current_job = self.jobs.create(spec)
+                self.status.setText("Inputs saved; use Retry with offline planner to replan.")
             return
         record = self.database.get_job(self.current_job.id)
         if record.state not in {JobState.PREFLIGHT, JobState.NEEDS_ATTENTION}:
@@ -760,8 +789,14 @@ class MainWindow(QMainWindow):
 
     def review_job(self):
         record = self.database.get_job(self._selected_job_id())
-        if not record or not record.plan:
-            self._error("Select a job with a saved plan.")
+        if not record:
+            self._error("Select a saved job.")
+            return
+        if not record.plan:
+            self.current_job = record
+            self.plan_view.setPlainText(record.spec.model_dump_json(indent=2))
+            self.status.setText("Preserved inputs loaded; edit assignments or retry offline.")
+            self._invalidate_plan()
             return
         if record.state in {
             JobState.QUEUED,
@@ -772,7 +807,12 @@ class MainWindow(QMainWindow):
             self._error("Wait for the active build, or cancel it before regeneration.")
             return
         self.profile_combo.setCurrentIndex(self.profile_combo.findData(record.spec.profile_id))
-        if record.state in {JobState.READY, JobState.FAILED, JobState.CANCELLED}:
+        if record.state in {
+            JobState.READY,
+            JobState.FAILED,
+            JobState.CANCELLED,
+            JobState.NEEDS_ATTENTION,
+        }:
             if (
                 QMessageBox.question(self, "Regenerate", "Create a new job using this saved plan?")
                 != QMessageBox.StandardButton.Yes
@@ -787,6 +827,32 @@ class MainWindow(QMainWindow):
         self.batch_builds = []
         self.current_job = record
         self._plan_complete(record.plan)
+
+    def manage_cache(self):
+        if self.database.list_jobs([JobState.ANALYZING, JobState.BUILDING, JobState.QUEUED]):
+            self._error("Wait for active jobs before managing the cache.")
+            return
+        cache = ManagedCache(self.paths.cache)
+        limit, accepted = QInputDialog.getInt(
+            self,
+            "Derivative cache",
+            f"Usage: {cache.usage_bytes() / 1024**3:.2f} GiB. "
+            f"Pinned jobs: {len(cache.pins())}.\nKeep at most this many GiB of unpinned derivatives:",
+            int(self.database.get_setting("cache_limit_gb", "20")),
+            0,
+            10000,
+        )
+        if not accepted:
+            return
+        self.database.set_setting("cache_limit_gb", str(limit))
+        removed = cache.cleanup(limit * 1024**3)
+        QMessageBox.information(
+            self,
+            "Cache cleanup",
+            f"Deleted {len(removed)} unpinned derivative files. "
+            "Sources and pinned master WAVs were preserved. "
+            "Derivatives can be regenerated.",
+        )
 
     def closeEvent(self, event):
         active = self.database.list_jobs([JobState.ANALYZING, JobState.BUILDING, JobState.QUEUED])

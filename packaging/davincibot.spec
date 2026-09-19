@@ -7,7 +7,8 @@ a = Analysis(
     [str(root / "src" / "davincibot" / "__main__.py")],
     pathex=[str(root / "src")],
     binaries=[],
-    datas=[(str(root / "src" / "davincibot" / "resolve" / "runtime.py"), "davincibot/resolve")],
+    datas=[(str(root / "src" / "davincibot" / "resolve" / name), "davincibot/resolve")
+           for name in ("runtime.py", "interchange.py")],
     hiddenimports=[
         "keyring.backends.Windows",
         "davincibot.resolve.launcher",

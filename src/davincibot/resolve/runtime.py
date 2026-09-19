@@ -49,20 +49,25 @@ def track(timeline, kind, name):
     return index
 
 
-def transparent_png(path):
+def transparent_png(path, width=1920, height=1080):
     def chunk(kind, data):
         return (
             struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
         )
 
     data = b"\x89PNG\r\n\x1a\n"
-    data += chunk(b"IHDR", struct.pack(">2I5B", 16, 16, 8, 6, 0, 0, 0))
-    data += chunk(b"IDAT", zlib.compress((b"\x00" + b"\x00" * 64) * 16))
+    data += chunk(b"IHDR", struct.pack(">2I5B", width, height, 8, 6, 0, 0, 0))
+    compressor = zlib.compressobj()
+    compressed = bytearray()
+    for _ in range(height):
+        compressed.extend(compressor.compress(b"\x00" * (width * 4 + 1)))
+    compressed.extend(compressor.flush())
+    data += chunk(b"IDAT", bytes(compressed))
     data += chunk(b"IEND", b"")
     path.write_bytes(data)
 
 
-def populate(project, timeline, spec, plan, template, support_root):
+def populate(project, timeline, spec, plan, template, support_root, base_timeline=None):
     support_root = Path(support_root)
     support_root.mkdir(parents=True, exist_ok=True)
     pool = project.GetMediaPool()
@@ -85,6 +90,11 @@ def populate(project, timeline, spec, plan, template, support_root):
 
     def segment_track(segment):
         asset = assets[segment["asset_id"]]
+        # A B-roll asset can be a primary montage clip; explicit layer wins.
+        if segment["track"] == "DBOT_B_ROLL":
+            return roles.get("b_roll", segment["track"])
+        if asset["role"] == "b_roll":
+            return segment["track"]
         return roles.get(asset["role"], segment["track"])
 
     video_names = {segment_track(s) for s in plan["segments"]}
@@ -115,6 +125,12 @@ def populate(project, timeline, spec, plan, template, support_root):
         result = checked(pool.AppendToTimeline([info]), "clip append failed")
         if len(result) != 1:
             raise ResolveBuildError("Resolve returned the wrong number of appended clips")
+        get_duration = getattr(result[0], "GetDuration", None)
+        if callable(get_duration):
+            actual = get_duration()
+            expected = round((end - start) * fps)
+            if actual is None or abs(float(actual) - expected) > 1:
+                raise ResolveBuildError("Resolve clip duration differs from the approved plan")
         return result[0]
 
     reference_index = None
@@ -125,21 +141,44 @@ def populate(project, timeline, spec, plan, template, support_root):
             existing = timeline.GetItemListInTrack("audio", index) or []
             if existing:
                 checked(timeline.DeleteClips(existing, False), "could not clear generated audio")
+    if base_timeline:
+        duration = max(
+            s["timeline_start"] + s["source_out"] - s["source_in"] for s in plan["segments"]
+        )
+        checked(
+            pool.AppendToTimeline(
+                [
+                    {
+                        "mediaPoolItem": base_timeline.GetMediaPoolItem(),
+                        "startFrame": 0,
+                        "endFrame": max(0, round(duration * fps) - 1),
+                        "recordFrame": origin,
+                        "trackIndex": track(timeline, "video", "DBOT_A_ROLL"),
+                        "mediaType": 1,
+                    }
+                ]
+            ),
+            "could not append editable base timeline",
+        )
     for segment in plan["segments"]:
         asset = assets[segment["asset_id"]]
         rate = (asset.get("media") or {}).get("frame_rate") or fps
-        item = append(
-            asset["path"],
-            segment["source_in"],
-            segment["source_out"],
-            segment["timeline_start"],
-            segment_track(segment),
-            rate,
+        item = (
+            None
+            if base_timeline
+            else append(
+                asset["path"],
+                segment["source_in"],
+                segment["source_out"],
+                segment["timeline_start"],
+                segment_track(segment),
+                rate,
+            )
         )
         speed = float(segment.get("speed", 1))
         if abs(speed - 1) > 0.0001:
-            checked(item.SetProperty("Speed", speed), "clip speed change failed")
-        if segment.get("layout") == "punch_in":
+            raise ResolveBuildError("retiming is not supported by this backend")
+        if item and segment.get("layout") == "punch_in":
             zoom = float(params.get("punch_in_zoom", 1.15))
             checked(item.SetProperty("ZoomX", zoom), "punch-in ZoomX failed")
             checked(item.SetProperty("ZoomY", zoom), "punch-in ZoomY failed")
@@ -164,6 +203,16 @@ def populate(project, timeline, spec, plan, template, support_root):
             timeline.SetTrackEnable("audio", reference_index, False),
             "could not mute reference audio",
         )
+        for role in ("voice", "music"):
+            for index, asset in enumerate(a for a in spec["assets"] if a["role"] == role):
+                name = f"DBOT_REFERENCE_{role.upper()}_{index + 1}"
+                length = (asset.get("media") or {}).get("duration_seconds", 0)
+                if length > 0:
+                    append(asset["path"], 0, min(length, duration), 0, name, fps, "audio")
+                    checked(
+                        timeline.SetTrackEnable("audio", track(timeline, "audio", name), False),
+                        "could not disable original audio reference",
+                    )
 
     def title(text, start, length, name, caption=False):
         if caption:
@@ -181,12 +230,40 @@ def populate(project, timeline, spec, plan, template, support_root):
                     current = candidate
             if current:
                 lines.append(current)
-            text = "\\n".join(lines[: int(policy.get("max_lines", 2))])
-        background = support_root / "transparent.png"
+            maximum = int(policy.get("max_lines", 2))
+            if len(lines) > maximum:
+                groups = [lines[i : i + maximum] for i in range(0, len(lines), maximum)]
+                step = length / len(groups)
+                for index, group in enumerate(groups):
+                    title("\n".join(group), start + index * step, step, name, True)
+                return
+            text = "\n".join(lines)
+        defaults = (spec.get("profile_snapshot") or {}).get("timeline", {})
+        width, height = int(defaults.get("width", 1920)), int(defaults.get("height", 1080))
+        background = support_root / f"transparent-{width}x{height}.png"
         if not background.exists():
-            transparent_png(background)
+            transparent_png(background, width, height)
         item = append(background, 0, length, start, name, fps)
-        comp = checked(item.AddFusionComp(), "could not add editable Fusion composition")
+        registered = {Path(path).stem: path for path in template.get("fusion_assets", [])}
+        caption_name = ((spec.get("profile_snapshot") or {}).get("captions") or {}).get(
+            "template_name", "DBOT Caption"
+        )
+        comp_path = registered.get(caption_name if caption else "DBOT Callout")
+        comp = checked(
+            item.ImportFusionComp(comp_path) if comp_path else item.AddFusionComp(),
+            "could not add editable Fusion composition",
+        )
+        if comp_path:
+            tools = comp.GetToolList(False, "TextPlus") or {}
+            if len(tools) != 1:
+                raise ResolveBuildError(
+                    "registered title composition must contain exactly one TextPlus"
+                )
+            checked(
+                next(iter(tools.values())).SetInput("StyledText", text),
+                "could not update registered title",
+            )
+            return
         text_tool = checked(comp.AddTool("TextPlus"), "TextPlus is unavailable")
         output = checked(comp.AddTool("MediaOut"), "Fusion MediaOut is unavailable")
         checked(text_tool.SetInput("StyledText", text), "could not set title text")
@@ -233,18 +310,23 @@ def build(resolve, spec, plan, template, support_root):
     if (plan["template_id"], plan["template_version"]) != (template["id"], template["version"]):
         raise ResolveBuildError("template version mismatch")
     for segment in plan["segments"]:
-        if segment.get("transition", "cut") != "cut":
+        if segment.get("transition", "cut") not in {"cut", "cross_dissolve"}:
             raise ResolveBuildError(
                 "non-cut transitions require a registered Resolve transition asset"
             )
-        if float(segment.get("speed", 1)) <= 0:
-            raise ResolveBuildError("clip speed must be positive")
+        if float(segment.get("speed", 1)) != 1:
+            raise ResolveBuildError("retiming is not supported by this backend")
         if not segment["track"].startswith("DBOT_"):
             raise ResolveBuildError("invalid generated track")
     for asset in spec["assets"]:
         stat = Path(asset["path"]).stat()
         if stat.st_size != asset["size_bytes"] or stat.st_mtime_ns != asset["modified_ns"]:
             raise ResolveBuildError("source changed after approval; rescan before building")
+    if template.get("source_snapshot") and template.get("snapshot_sha256"):
+        import hashlib
+        with Path(template["source_snapshot"]).open("rb") as handle:
+            if hashlib.file_digest(handle, "sha256").hexdigest() != template["snapshot_sha256"]:
+                raise ResolveBuildError("registered template snapshot changed after approval")
     manager = resolve.GetProjectManager()
     project = manager.GetCurrentProject()
     if not project or project.GetName() != spec["target_project"]:
@@ -263,16 +345,19 @@ def build(resolve, spec, plan, template, support_root):
     source = next((t for t in timelines if t.GetName() == template["timeline_name"]), None)
     name = next_timeline_name(project, plan["timeline_name"])
     pool = project.GetMediaPool()
+    original = project.GetCurrentTimeline()
     if template.get("source_snapshot"):
         timeline = checked(
-            pool.ImportTimelineFromFile(template["source_snapshot"], {"timelineName": name}),
+            pool.ImportTimelineFromFile(template["source_snapshot"]),
             "could not import registered template snapshot",
         )
     else:
         checked(source, "template timeline not found; register a real Resolve timeline first")
         timeline = checked(source.DuplicateTimeline(name), "could not duplicate template")
-    original = project.GetCurrentTimeline()
+    created = [timeline]
     try:
+        if timeline.GetName() != name:
+            checked(timeline.SetName(name), "could not name generated template copy")
         checked(project.SetCurrentTimeline(timeline), "could not select generated timeline")
         profile = spec.get("profile_snapshot") or {}
         defaults = profile.get("timeline", {})
@@ -287,9 +372,65 @@ def build(resolve, spec, plan, template, support_root):
                 checked(
                     timeline.SetSetting(setting, str(defaults[key])), f"could not set {setting}"
                 )
-        populate(project, timeline, spec, plan, template, support_root)
+        if defaults:
+            checked(
+                timeline.SetStartTimecode(defaults.get("start_timecode", "01:00:00:00")),
+                "could not set timeline start timecode",
+            )
+        base_timeline = None
+        if any(s.get("transition") == "cross_dissolve" for s in plan["segments"]):
+            try:
+                from davincibot.resolve.interchange import write_xml
+            except ImportError:
+                import runpy
+
+                write_xml = runpy.run_path(
+                    str(Path(__file__).with_name("davincibot_interchange.py"))
+                )["write_xml"]
+            xml_path = support_root / (spec["id"] + ".xml")
+            write_xml(xml_path, spec, plan, template)
+            base_timeline = checked(
+                pool.ImportTimelineFromFile(
+                    str(xml_path), {"timelineName": name + "_Base", "importSourceClips": True}
+                ),
+                "XML base import failed",
+            )
+            created.append(base_timeline)
+            by_track = {}
+            for segment in plan["segments"]:
+                by_track.setdefault(segment["track"], []).append(segment)
+            for index, (track_name, segments) in enumerate(sorted(by_track.items()), 1):
+                checked(
+                    base_timeline.SetTrackName("video", index, track_name),
+                    "base track naming failed",
+                )
+                clips = list(base_timeline.GetItemListInTrack("video", index) or [])
+                if len(clips) != len(segments):
+                    raise ResolveBuildError("XML import clip count mismatch")
+                for clip, segment in zip(
+                    clips, sorted(segments, key=lambda s: s["timeline_start"]), strict=True
+                ):
+                    if segment.get("layout") == "punch_in":
+                        for key in ("ZoomX", "ZoomY"):
+                            checked(
+                                clip.SetProperty(
+                                    key,
+                                    float(
+                                        template.get("parameters", {}).get("punch_in_zoom", 1.15)
+                                    ),
+                                ),
+                                "base punch-in failed",
+                            )
+            checked(project.SetCurrentTimeline(timeline), "could not restore review timeline")
+        populate(project, timeline, spec, plan, template, support_root, base_timeline)
+        marker_frame = 0
+        existing_markers = timeline.GetMarkers() or {}
+        while marker_frame in existing_markers:
+            marker_frame += 1
         checked(
-            timeline.AddMarker(0, "Green", "DaVinciBot", "Ready for review", 1, marker_id),
+            timeline.AddMarker(
+                marker_frame, "Green", "DaVinciBot", "Ready for review", 1, marker_id
+            ),
             "could not write job completion marker",
         )
         checked(manager.SaveProject(), "project save failed")
@@ -298,7 +439,7 @@ def build(resolve, spec, plan, template, support_root):
     except Exception as error:
         if original:
             project.SetCurrentTimeline(original)
-        removed = pool.DeleteTimelines([timeline])
+        removed = pool.DeleteTimelines(created)
         saved = manager.SaveProject()
         if not removed or not saved:
             raise ResolveBuildError(

@@ -190,7 +190,7 @@ def test_runtime_uses_source_frame_rate_and_applies_edit_properties(tmp_path: Pa
                 source_out=2,
                 timeline_start=0,
                 layout="punch_in",
-                speed=1.5,
+                speed=1,
             )
         ],
         captions=[CaptionCue(start_seconds=0, end_seconds=1, text="A caption")],
@@ -208,7 +208,7 @@ def test_runtime_uses_source_frame_rate_and_applies_edit_properties(tmp_path: Pa
     video = next(item for item in timeline.appended if item["mediaType"] == 1)
     assert video["startFrame"] == 60
     assert video["endFrame"] == 119
-    assert any(clip.properties.get("Speed") == 1.5 for clip in timeline_project.pool.clips)
+    assert any(clip.properties.get("ZoomX") == 1.2 for clip in timeline_project.pool.clips)
 
 
 def test_job_state_machine_blocks_invalid_transitions(tmp_path: Path) -> None:

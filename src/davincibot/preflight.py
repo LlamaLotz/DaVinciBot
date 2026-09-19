@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from math import gcd
 
 from davincibot.models import AssetRole, EditPlan, JobSpec, TemplateManifest, WorkspaceProfile
+from davincibot.resolve.interchange import transition_errors
 from davincibot.templates import validate_template
 
 
@@ -54,6 +55,13 @@ def run_preflight(
     if profile.captions.required and not spec.captions:
         report.errors.append("this profile requires an SRT or VTT caption file")
     asset_ids = {asset.id for asset in spec.assets}
+    voices = [
+        a
+        for a in spec.assets
+        if a.id in plan.audio.dialogue_asset_ids and a.role is AssetRole.VOICE
+    ]
+    if len(voices) > 1 or len(plan.audio.music_asset_ids) > 1:
+        report.errors.append("assign at most one voice-over and one music bed per job")
     for asset in spec.assets:
         try:
             stat = asset.path.stat()
@@ -85,18 +93,37 @@ def run_preflight(
             )
         elif any(cue.end_seconds > a.media.duration_seconds + 0.05 for a in matches):
             report.errors.append("caption timing exceeds its source duration")
-        if not cue.source_asset_id and len(matches) > 1:
+        if (
+            not cue.source_asset_id
+            and len(matches) > 1
+            and plan.workflow.value != "podcast_interview"
+        ):
             report.errors.append(
                 "ambiguous caption source; assign source_asset_id in the job editor"
             )
     for segment in plan.segments:
         if segment.asset_id not in asset_ids:
             report.errors.append(f"segment references missing asset: {segment.asset_id}")
-        if segment.transition != "cut":
-            report.errors.append(
-                "non-cut transitions are not implemented by the current Resolve backend"
-            )
+        if segment.transition not in {"cut", "cross_dissolve"}:
+            report.errors.append("transition has no registered implementation")
+    report.errors.extend(
+        transition_errors(
+            spec.model_dump(mode="json"),
+            plan.model_dump(mode="json"),
+            template.model_dump(mode="json"),
+        )
+    )
+    if any(s.transition == "cross_dissolve" for s in plan.segments):
+        report.warnings.append(
+            "Dissolves use an editable nested XML base timeline; "
+            "open the base timeline to edit individual clips."
+        )
     if plan.workflow.value == "podcast_interview":
+        cameras = [a for a in spec.assets if a.role is AssetRole.CAMERA]
+        if len(cameras) > 1 and any(a.id not in spec.analysis.get("offsets", {}) for a in cameras):
+            report.errors.append(
+                "camera synchronization has not been analyzed; replan before building"
+            )
         report.warnings.append(
             "podcast camera switching uses caption speaker labels; verify sync in Resolve"
         )

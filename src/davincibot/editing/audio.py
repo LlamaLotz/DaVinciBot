@@ -25,15 +25,16 @@ def prepare_audio(spec, plan, cache_root: Path, cancelled=lambda: False):
         if assets[s.asset_id].media
         and assets[s.asset_id].media.channels
         and assets[s.asset_id].role in {AssetRole.A_ROLL, AssetRole.CAMERA}
+        and s.asset_id in plan.audio.dialogue_asset_ids
     ]
     music = [assets[key] for key in plan.audio.music_asset_ids]
     voice = [
-        assets[key]
-        for key in plan.audio.dialogue_asset_ids
-        if assets[key].role is AssetRole.VOICE
+        assets[key] for key in plan.audio.dialogue_asset_ids if assets[key].role is AssetRole.VOICE
     ]
     if not sound and not music and not voice:
         return None
+    if len(voice) > 1 or len(music) > 1:
+        raise MediaToolError("assign one voice-over and one music bed per job")
     settings = {
         "version": 1,
         "segments": [s.model_dump() for s in primary],
@@ -162,9 +163,12 @@ def prepare_audio(spec, plan, cache_root: Path, cancelled=lambda: False):
     inputs = ["-threads", "1", "-i", str(dialogue)]
     if music:
         inputs += ["-stream_loop", "-1", "-threads", "1", "-i", str(music[0].path)]
+        policy = spec.profile_snapshot.audio if spec.profile_snapshot else None
+        attack = policy.attack_ms if policy else 120
+        release = policy.release_ms if policy else 500
         graph = (
             f"[0:a]asplit=2[dry][side];[1:a]volume={plan.audio.duck_db}dB[bed];"
-            "[bed][side]sidechaincompress=threshold=0.02:ratio=6:attack=120:release=500[duck];"
+            f"[bed][side]sidechaincompress=threshold=0.02:ratio=6:attack={attack}:release={release}[duck];"
             "[dry][duck]amix=inputs=2:duration=first:normalize=0[mix];"
         )
         label = "[mix]"

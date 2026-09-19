@@ -5,6 +5,7 @@ from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import UTC, datetime
 
+from davincibot.cache import ManagedCache
 from davincibot.database import Database
 from davincibot.editing.audio import prepare_audio
 from davincibot.models import EditPlan, JobRecord, JobSpec, JobState, TemplateManifest
@@ -145,6 +146,8 @@ class JobService:
                     self.paths.cache,
                     lambda: self._required(current.id).state is JobState.CANCELLED,
                 )
+                if current.spec.prepared_audio:
+                    ManagedCache(self.paths.cache).pin(current.id, [current.spec.prepared_audio])
                 with self._lock:
                     if self._required(current.id).state is JobState.CANCELLED:
                         return self._required(current.id)

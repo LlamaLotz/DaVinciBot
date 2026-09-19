@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from abc import ABC, abstractmethod
+from copy import deepcopy
 from typing import Any
 
 import httpx
@@ -22,6 +23,8 @@ class PlannerProvider(ABC):
 def _object(value: Any) -> dict[str, Any]:
     if not isinstance(value, str) or not value.strip():
         raise ProviderError("provider response did not contain JSON content")
+    if len(value.encode("utf-8")) > 2_000_000:
+        raise ProviderError("provider response exceeds the 2 MB limit")
     value = value.strip()
     if value.startswith("```"):
         try:
@@ -37,11 +40,39 @@ def _object(value: Any) -> dict[str, Any]:
     return payload
 
 
+def strict_schema(schema):
+    """OpenAI strict output requires every property, including nullable properties."""
+    result = deepcopy(schema)
+
+    def visit(node):
+        if isinstance(node, dict):
+            node.pop("default", None)
+            if node.get("type") == "object":
+                node["required"] = list(node.get("properties", {}))
+                node["additionalProperties"] = False
+            for child in node.values():
+                visit(child)
+        elif isinstance(node, list):
+            for child in node:
+                visit(child)
+
+    visit(result)
+    return result
+
+
 def _post(*args, **kwargs):
     try:
-        return httpx.post(*args, **kwargs)
+        with httpx.stream("POST", *args, **kwargs) as response:
+            chunks = bytearray()
+            for chunk in response.iter_bytes():
+                if len(chunks) + len(chunk) > 2_000_000:
+                    raise ProviderError("provider response exceeds the 2 MB limit")
+                chunks.extend(chunk)
+            return httpx.Response(response.status_code, content=bytes(chunks))
     except httpx.HTTPError as error:
-        raise ProviderError(f"planner network request failed: {error}") from error
+        raise ProviderError(
+            "planner network request failed; check connection and endpoint"
+        ) from error
 
 
 class OpenAIChatProvider(PlannerProvider):
@@ -60,13 +91,12 @@ class OpenAIChatProvider(PlannerProvider):
                     {"role": "system", "content": system},
                     {"role": "user", "content": user},
                 ],
-                "temperature": 0,
                 "response_format": {
                     "type": "json_schema",
                     "json_schema": {
                         "name": "davincibot_edit_plan",
                         "strict": True,
-                        "schema": schema,
+                        "schema": strict_schema(schema),
                     },
                 },
             },

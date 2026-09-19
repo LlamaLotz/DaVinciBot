@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from collections import Counter
 from pathlib import Path
 from typing import Any
 
 from davincibot.models import AssetRole, TemplateManifest, TemplateSlot, WorkflowKind, WorkspaceMode
 
-SUPPORTED_TRANSITIONS = {"cut"}
+SUPPORTED_TRANSITIONS = {"cut", "cross_dissolve"}
 
 
 def configured_template(template: TemplateManifest, overrides: dict) -> TemplateManifest:
@@ -19,6 +20,7 @@ def configured_template(template: TemplateManifest, overrides: dict) -> Template
         "punch_in_zoom": (1, 3),
         "font_size": (0.005, 0.2),
         "caption_y": (0.05, 0.95),
+        "transition_seconds": (0.05, 2),
     }
     supported = set(numeric) | {"font", "transition"}
     for key, value in parameters.items():
@@ -35,9 +37,7 @@ def configured_template(template: TemplateManifest, overrides: dict) -> Template
         elif not isinstance(value, str) or not value.strip():
             raise ValueError(f"{key} must be nonempty text")
     if parameters.get("transition", "cut") not in SUPPORTED_TRANSITIONS:
-        raise ValueError(
-            "this build supports hard cuts; other transitions require a future interchange backend"
-        )
+        raise ValueError("supported standard transitions are cut and cross_dissolve")
     return template.model_copy(deep=True, update={"parameters": parameters})
 
 
@@ -82,6 +82,10 @@ def validate_template(template: TemplateManifest) -> TemplateValidation:
             errors.append(f"Fusion asset does not exist: {asset}")
     if template.source_snapshot and not template.source_snapshot.exists():
         errors.append(f"template snapshot does not exist: {template.source_snapshot}")
+    elif template.source_snapshot and template.snapshot_sha256:
+        with template.source_snapshot.open("rb") as handle:
+            if hashlib.file_digest(handle, "sha256").hexdigest() != template.snapshot_sha256:
+                errors.append("registered template snapshot changed; register a new version")
     if not template.slots:
         warnings.append("template has no marker-bound slots")
     return TemplateValidation(errors, warnings)

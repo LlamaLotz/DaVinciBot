@@ -73,7 +73,7 @@ def test_provider_null_content_is_reported_as_provider_error(monkeypatch) -> Non
             return {"choices": [{"message": {"content": None}}]}
 
     monkeypatch.setattr(
-        "davincibot.planner.providers.httpx.post", lambda *args, **kwargs: Response()
+        "davincibot.planner.providers._post", lambda *args, **kwargs: Response()
     )
     with pytest.raises(ProviderError, match="did not contain JSON content"):
         OpenAIChatProvider("secret", "model").complete_json("system", "user", {})

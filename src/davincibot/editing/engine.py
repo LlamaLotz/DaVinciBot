@@ -82,7 +82,9 @@ def build_rule_segments(
     assets: list[AssetRef],
     captions: list[CaptionCue],
     template: TemplateManifest,
+    analysis: dict | None = None,
 ) -> tuple[list[EditSegment], list[GraphicEvent], list[str]]:
+    analysis = analysis or {}
     videos = [
         asset
         for asset in assets
@@ -102,17 +104,22 @@ def build_rule_segments(
                     "target_duration", 30 if mode is WorkspaceMode.SHORT_FORM else 120
                 )
             ),
+            analysis.get("beats", []),
         )
     elif workflow is WorkflowKind.PODCAST_INTERVIEW:
-        segments = _podcast(primary, captions, template)
+        segments = _podcast(primary, captions, template, analysis.get("offsets", {}))
+    elif workflow is WorkflowKind.NARRATED_YOUTUBE:
+        voices = [a for a in assets if a.role is AssetRole.VOICE and _duration(a) > 0]
+        segments = (
+            _montage(broll or videos, template, sum(map(_duration, voices))) if voices else []
+        )
     else:
-        segments = _speech_edit(primary, captions, template, mode)
+        segments = _speech_edit(primary, captions, template, mode, analysis.get("speech", {}))
     if not segments:
         return [], [], ["No usable primary video segments were produced."]
     if broll and workflow in {
         WorkflowKind.TALKING_HEAD,
         WorkflowKind.EDUCATIONAL,
-        WorkflowKind.NARRATED_YOUTUBE,
     }:
         end = max(
             segment.timeline_start + segment.source_out - segment.source_in for segment in segments
@@ -158,6 +165,7 @@ def _speech_edit(
     captions: list[CaptionCue],
     template: TemplateManifest,
     mode: WorkspaceMode,
+    speech: dict | None = None,
 ) -> list[EditSegment]:
     if not primary:
         return []
@@ -182,6 +190,18 @@ def _speech_edit(
             and (not cue.group_key or cue.group_key == asset.group_key)
         ]
         ranges = speech_ranges(matched, max_length=max_length)
+        if not matched and speech and asset.id in speech:
+            ranges = speech_ranges(
+                [
+                    CaptionCue(start_seconds=start, end_seconds=end, text="speech")
+                    for start, end in speech[asset.id]
+                    if end > start
+                ],
+                padding=0,
+                max_length=max_length,
+            )
+            if not ranges:
+                continue
         if not ranges:
             ranges = speech_ranges(
                 [CaptionCue(start_seconds=0, end_seconds=_duration(asset), text="source")],
@@ -207,7 +227,10 @@ def _speech_edit(
 
 
 def _montage(
-    videos: list[AssetRef], template: TemplateManifest, target_duration: float
+    videos: list[AssetRef],
+    template: TemplateManifest,
+    target_duration: float,
+    beats: list[float] | None = None,
 ) -> list[EditSegment]:
     if not videos:
         return []
@@ -221,6 +244,11 @@ def _montage(
             _duration(asset),
             target_duration - position,
         )
+        candidates = [
+            beat for beat in (beats or []) if position + 0.25 <= beat <= position + length
+        ]
+        if candidates and target_duration - position > length:
+            length = candidates[-1] - position
         if length > 0:
             output.append(
                 EditSegment(
@@ -236,7 +264,10 @@ def _montage(
 
 
 def _podcast(
-    cameras: list[AssetRef], captions: list[CaptionCue], template: TemplateManifest
+    cameras: list[AssetRef],
+    captions: list[CaptionCue],
+    template: TemplateManifest,
+    offsets: dict | None = None,
 ) -> list[EditSegment]:
     if not cameras:
         return []
@@ -247,12 +278,16 @@ def _podcast(
     output: list[EditSegment] = []
     speakers: dict[str, int] = {}
     position = 0.0
-    for index, (start, end) in enumerate(speech_ranges(captions, max_length=20)):
-        cue = next((item for item in captions if item.start_seconds >= start), captions[0])
+    last_end = 0.0
+    for index, cue in enumerate(sorted(captions, key=lambda item: item.start_seconds)):
+        start, end = max(last_end, cue.start_seconds - 0.08), cue.end_seconds + 0.08
+        last_end = end
         key = cue.speaker or "default"
         camera_index = speakers.setdefault(key, len(speakers) % len(cameras))
         camera = cameras[camera_index]
-        end = min(end, _duration(camera))
+        offset = (offsets or {}).get(camera.id, 0)
+        start = max(0, start + offset)
+        end = min(end + offset, _duration(camera))
         if end <= start:
             continue
         output.append(

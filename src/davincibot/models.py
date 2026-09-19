@@ -83,12 +83,12 @@ class FolderRule(StrictModel):
 
 
 class AudioPolicy(StrictModel):
-    target_lufs: float = -14.0
-    true_peak_db: float = -1.0
-    music_duck_db: float = -12.0
-    attack_ms: int = 120
-    release_ms: int = 500
-    fade_ms: int = 250
+    target_lufs: float = Field(default=-14, ge=-70, le=-5)
+    true_peak_db: float = Field(default=-1, ge=-9, le=0)
+    music_duck_db: float = Field(default=-12, ge=-60, le=0)
+    attack_ms: int = Field(default=120, ge=1, le=2000)
+    release_ms: int = Field(default=500, ge=1, le=9000)
+    fade_ms: int = Field(default=250, ge=0, le=10000)
     preserve_reference_tracks: bool = True
 
 
@@ -101,8 +101,8 @@ class CaptionPolicy(StrictModel):
 
 
 class TimelineDefaults(StrictModel):
-    width: int = Field(default=1920, gt=0)
-    height: int = Field(default=1080, gt=0)
+    width: int = Field(default=1920, gt=0, le=8192)
+    height: int = Field(default=1080, gt=0, le=8192)
     frame_rate: float = Field(default=30.0, gt=0)
     start_timecode: str = "01:00:00:00"
 
@@ -120,6 +120,9 @@ class WorkspaceProfile(StrictModel):
     timeline: TimelineDefaults = Field(default_factory=TimelineDefaults)
     batch_confidence_threshold: float = Field(default=0.85, ge=0, le=1)
     group_by_subfolder: bool = True
+    remove_silence: bool = True
+    align_music_beats: bool = True
+    synchronize_cameras: bool = True
 
     @model_validator(mode="after")
     def unique_folder_roles(self) -> WorkspaceProfile:
@@ -155,6 +158,7 @@ class TemplateManifest(StrictModel):
     fusion_assets: list[Path] = Field(default_factory=list)
     parameters: dict[str, Any] = Field(default_factory=dict)
     source_snapshot: Path | None = None
+    snapshot_sha256: str | None = None
     frame_rate: float | None = Field(default=None, gt=0)
 
     @model_validator(mode="after")
@@ -217,6 +221,7 @@ class JobSpec(StrictModel):
     profile_snapshot: WorkspaceProfile | None = None
     template_snapshot: TemplateManifest | None = None
     prepared_audio: Path | None = None
+    analysis: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=utc_now)
 
 
@@ -249,9 +254,9 @@ class GraphicEvent(StrictModel):
 class AudioInstruction(StrictModel):
     dialogue_asset_ids: list[str] = Field(default_factory=list)
     music_asset_ids: list[str] = Field(default_factory=list)
-    target_lufs: float = -14.0
-    true_peak_db: float = -1.0
-    duck_db: float = -12.0
+    target_lufs: float = Field(default=-14, ge=-70, le=-5)
+    true_peak_db: float = Field(default=-1, ge=-9, le=0)
+    duck_db: float = Field(default=-12, ge=-60, le=0)
 
 
 class EditPlan(StrictModel):
