@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling>=1.26"]
+build-backend = "hatchling.build"
+
+[project]
+name = "davincibot"
+version = "0.1.0"
+description = "Resource-aware, template-driven DaVinci Resolve automation"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+  "pydantic>=2.9,<3",
+  "PySide6>=6.8,<7",
+  "keyring>=25.4,<26",
+  "httpx>=0.27,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "build>=1.2,<2",
+  "pyinstaller>=6.11,<7",
+  "pytest>=8.3,<9",
+  "pytest-cov>=6,<7",
+  "ruff>=0.8,<1",
+]
+
+[project.scripts]
+davincibot = "davincibot.__main__:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/davincibot"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

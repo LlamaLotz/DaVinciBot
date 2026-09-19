@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.pytest_tmp/
+test-temp/
+.ruff_cache/
+.mypy_cache/
+.venv/
+dist/
+build/
+graphify-out/
+*.db
+*.sqlite3
+.env
